@@ -26578,6 +26578,179 @@ cr.behaviors.scrollto = function(runtime)
 	
 }());
 
+// Piscar
+// ECMAScript 5 strict mode
+
+;
+;
+
+/////////////////////////////////////
+// Behavior class
+cr.behaviors.Flash = function(runtime)
+{
+	this.runtime = runtime;
+};
+
+(function ()
+{
+	var behaviorProto = cr.behaviors.Flash.prototype;
+		
+	/////////////////////////////////////
+	// Behavior type class
+	behaviorProto.Type = function(behavior, objtype)
+	{
+		this.behavior = behavior;
+		this.objtype = objtype;
+		this.runtime = behavior.runtime;
+	};
+	
+	var behtypeProto = behaviorProto.Type.prototype;
+
+	behtypeProto.onCreate = function()
+	{
+	};
+
+	/////////////////////////////////////
+	// Behavior instance class
+	behaviorProto.Instance = function(type, inst)
+	{
+		this.type = type;
+		this.behavior = type.behavior;
+		this.inst = inst;				// associated object instance to modify
+		this.runtime = type.runtime;
+	};
+	
+	var behinstProto = behaviorProto.Instance.prototype;
+
+	behinstProto.onCreate = function()
+	{
+		this.ontime = 0;
+		this.offtime = 0;
+		this.stage = 0;			// 0 = on, 1 = off
+		this.stagetimeleft = 0;
+		this.timeleft = 0;
+	};
+	
+	behinstProto.saveToJSON = function ()
+	{
+		return {
+			"ontime": this.ontime,
+			"offtime": this.offtime,
+			"stage": this.stage,
+			"stagetimeleft": this.stagetimeleft,
+			"timeleft": this.timeleft
+		};
+	};
+	
+	behinstProto.loadFromJSON = function (o)
+	{
+		this.ontime = o["ontime"];
+		this.offtime = o["offtime"];
+		this.stage = o["stage"];
+		this.stagetimeleft = o["stagetimeleft"];
+		this.timeleft = o["timeleft"];
+		
+		// JSON can't store the value Infinity, turning it to null instead.
+		// If we read a null value for time left, turn it back to infinity. (It could have been NaN or -Infinity, but we ignore those cases.)
+		if (this.timeleft === null)
+			this.timeleft = Infinity;
+	};
+
+	behinstProto.tick = function ()
+	{
+		if (this.timeleft <= 0)
+			return;		// not flashing
+			
+		var dt = this.runtime.getDt(this.inst);
+		
+		this.timeleft -= dt;
+		
+		// flash duration completed
+		if (this.timeleft <= 0)
+		{
+			this.timeleft = 0;
+			this.inst.visible = true; 
+			this.runtime.redraw = true;
+			this.runtime.trigger(cr.behaviors.Flash.prototype.cnds.OnFlashEnded, this.inst);
+			return;
+		}
+		
+		this.stagetimeleft -= dt;
+		
+		// switching
+		if (this.stagetimeleft <= 0)
+		{
+			// is on and switching off
+			if (this.stage === 0)
+			{
+				// switch off
+				this.inst.visible = false;
+				this.stage = 1;
+				this.stagetimeleft += this.offtime;
+			}
+			// is off and switching on
+			else
+			{
+				// switch on
+				this.inst.visible = true;
+				this.stage = 0;
+				this.stagetimeleft += this.ontime;
+			}
+			
+			this.runtime.redraw = true;
+		}
+	};
+	
+
+	//////////////////////////////////////
+	// Conditions
+	function Cnds() {};
+	
+	Cnds.prototype.IsFlashing = function ()
+	{
+		return this.timeleft > 0;
+	};
+	
+	Cnds.prototype.OnFlashEnded = function ()
+	{
+		return true;
+	};
+	
+	behaviorProto.cnds = new Cnds();
+
+	//////////////////////////////////////
+	// Actions
+	function Acts() {};
+
+	Acts.prototype.Flash = function (on_, off_, dur_)
+	{
+		this.ontime = on_;
+		this.offtime = off_;
+		this.stage = 1;		// always start off
+		this.stagetimeleft = off_;
+		this.timeleft = dur_;
+		
+		this.inst.visible = false;
+		this.runtime.redraw = true;
+	};
+	
+	Acts.prototype.StopFlashing = function ()
+	{
+		this.timeleft = 0;
+		this.inst.visible = true;
+		this.runtime.redraw = true;
+		return;
+	};
+	
+	behaviorProto.acts = new Acts();
+
+	//////////////////////////////////////
+	// Expressions
+	function Exps() {};
+	behaviorProto.exps = new Exps();
+	
+}());
+
 // Sólido
 // ECMAScript 5 strict mode
 
@@ -27129,6 +27302,7 @@ cr.getObjectRefTable = function () {
 		cr.behaviors.Platform,
 		cr.behaviors.bound,
 		cr.behaviors.scrollto,
+		cr.behaviors.Flash,
 		cr.behaviors.solid,
 		cr.plugins_.TiledBg,
 		cr.behaviors.jumpthru,
@@ -27139,6 +27313,7 @@ cr.getObjectRefTable = function () {
 		cr.plugins_.Sprite.prototype.acts.SetMirrored,
 		cr.plugins_.Sprite.prototype.cnds.OnCollision,
 		cr.plugins_.Sprite.prototype.acts.SetInstanceVar,
+		cr.system_object.prototype.acts.SubVar,
 		cr.plugins_.Sprite.prototype.cnds.CompareInstanceVar,
 		cr.system_object.prototype.acts.RestartLayout,
 		cr.system_object.prototype.acts.SetVar,
@@ -27146,7 +27321,19 @@ cr.getObjectRefTable = function () {
 		cr.plugins_.Sprite.prototype.acts.Destroy,
 		cr.system_object.prototype.cnds.EveryTick,
 		cr.plugins_.Text.prototype.acts.SetText,
-		cr.plugins_.Text.prototype.acts.SetVisible
+		cr.plugins_.Text.prototype.acts.SetVisible,
+		cr.system_object.prototype.acts.Wait,
+		cr.system_object.prototype.acts.GoToLayout,
+		cr.system_object.prototype.cnds.CompareVar,
+		cr.behaviors.Platform.prototype.cnds.IsOnFloor,
+		cr.behaviors.Platform.prototype.acts.SimulateControl,
+		cr.behaviors.Flash.prototype.acts.Flash,
+		cr.plugins_.Sprite.prototype.cnds.IsMirrored,
+		cr.system_object.prototype.acts.CreateObject,
+		cr.plugins_.Sprite.prototype.exps.X,
+		cr.plugins_.Sprite.prototype.exps.Y,
+		cr.plugins_.Sprite.prototype.cnds.OnCreated,
+		cr.plugins_.Sprite.prototype.acts.MoveForward
 	];
 };
 
