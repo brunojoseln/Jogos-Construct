@@ -23778,7 +23778,7 @@ cr.plugins_.Keyboard = function(runtime)
 
 }());
 
-// Partículas
+// Texto
 // ECMAScript 5 strict mode
 
 ;
@@ -23786,7 +23786,855 @@ cr.plugins_.Keyboard = function(runtime)
 
 /////////////////////////////////////
 // Plugin class
-cr.plugins_.Particles = function(runtime)
+cr.plugins_.Text = function(runtime)
+{
+	this.runtime = runtime;
+};
+
+(function ()
+{
+	var pluginProto = cr.plugins_.Text.prototype;
+
+	pluginProto.onCreate = function ()
+	{
+		// Override the 'set width' action
+		pluginProto.acts.SetWidth = function (w)
+		{
+			if (this.width !== w)
+			{
+				this.width = w;
+				this.text_changed = true;	// also recalculate text wrapping
+				this.set_bbox_changed();
+			}
+		};
+	};
+
+	/////////////////////////////////////
+	// Object type class
+	pluginProto.Type = function(plugin)
+	{
+		this.plugin = plugin;
+		this.runtime = plugin.runtime;
+	};
+
+	var typeProto = pluginProto.Type.prototype;
+
+	typeProto.onCreate = function()
+	{
+	};
+	
+	typeProto.onLostWebGLContext = function ()
+	{
+		if (this.is_family)
+			return;
+			
+		var i, len, inst;
+		for (i = 0, len = this.instances.length; i < len; i++)
+		{
+			inst = this.instances[i];
+			inst.mycanvas = null;
+			inst.myctx = null;
+			inst.mytex = null;
+		}
+	};
+
+	/////////////////////////////////////
+	// Instance class
+	pluginProto.Instance = function(type)
+	{
+		this.type = type;
+		this.runtime = type.runtime;
+		
+		if (this.recycled)
+			cr.clearArray(this.lines);
+		else
+			this.lines = [];		// for word wrapping
+		
+		this.text_changed = true;
+	};
+	
+	var instanceProto = pluginProto.Instance.prototype;
+
+	var requestedWebFonts = {};		// already requested web fonts have an entry here
+	
+	instanceProto.onCreate = function()
+	{
+		this.text = this.properties[0];
+		// note properties[1] corresponds to enable-bbcode, which is not supported in C2 runtime
+		this.facename = this.properties[2];
+		this.ptSize = this.properties[3];
+		this.line_height_offset = this.properties[4];
+		this.isBold = this.properties[5];
+		this.isItalic = this.properties[6];
+		var c = this.properties[7];
+		this.color = "rgb(" + Math.floor(c[0] * 255) + "," + Math.floor(c[1] * 255) + "," + Math.floor(c[2] * 255) + ")";
+		this.halign = this.properties[8];				// 0=left, 1=center, 2=right
+		this.valign = this.properties[9];				// 0=top, 1=center, 2=bottom
+		this.wrapbyword = (this.properties[10] === 0);	// 0=word, 1=character
+		this.visible = this.properties[11];
+		
+		this.lastwidth = this.width;
+		this.lastwrapwidth = this.width;
+		this.lastheight = this.height;
+		
+		this.font = "";				// complete canvas2d font name, e.g. "bold 12pt Arial", derived from other properties
+		this.fontstyle = "";
+		this.pxHeight = 0;
+		this.textWidth = 0;
+		this.textHeight = 0;
+		
+		this.updateFont();
+		
+		// For WebGL rendering
+		this.mycanvas = null;
+		this.myctx = null;
+		this.mytex = null;
+		this.need_text_redraw = false;
+		this.last_render_tick = this.runtime.tickcount;
+		
+		if (this.recycled)
+			this.rcTex.set(0, 0, 1, 1);
+		else
+			this.rcTex = new cr.rect(0, 0, 1, 1);
+			
+		// In WebGL renderer tick this text object to release memory if not rendered any more
+		if (this.runtime.glwrap)
+			this.runtime.tickMe(this);
+		
+;
+	};
+	
+	instanceProto.saveToJSON = function ()
+	{
+		return {
+			"t": this.text,
+			"f": this.font,
+			"c": this.color,
+			"ha": this.halign,
+			"va": this.valign,
+			"wr": this.wrapbyword,
+			"lho": this.line_height_offset,
+			"fn": this.facename,
+			"fs": this.fontstyle,
+			"ps": this.ptSize,
+			"pxh": this.pxHeight,
+			"tw": this.textWidth,
+			"th": this.textHeight,
+			"lrt": this.last_render_tick
+		};
+	};
+	
+	instanceProto.loadFromJSON = function (o)
+	{
+		this.text = o["t"];
+		this.font = o["f"];
+		this.color = o["c"];
+		this.halign = o["ha"];
+		this.valign = o["va"];
+		this.wrapbyword = o["wr"];
+		this.line_height_offset = o["lho"];
+		this.facename = o["fn"];
+		this.fontstyle = o["fs"];
+		this.ptSize = o["ps"];
+		this.pxHeight = o["pxh"];
+		this.textWidth = o["tw"];
+		this.textHeight = o["th"];
+		this.last_render_tick = o["lrt"];
+		
+		// Restore bold/italic flags based on fontstyle. Note for C2 compatibility, the fontstyle string is what is saved/loaded,
+		// but in C3 we use separate bold and italic flags.
+		this.isBold = this.fontstyle.indexOf("bold") !== 0;
+		this.isItalic = this.fontstyle.indexOf("italic") !== 0;
+		
+		this.text_changed = true;
+		this.lastwidth = this.width;
+		this.lastwrapwidth = this.width;
+		this.lastheight = this.height;
+	};
+	
+	instanceProto.tick = function ()
+	{
+		// In WebGL renderer, if not rendered for 300 frames (about 5 seconds), assume
+		// the object has gone off-screen and won't need its textures any more.
+		// This allows us to free its canvas, context and WebGL texture to save memory.
+		if (this.runtime.glwrap && this.mytex && (this.runtime.tickcount - this.last_render_tick >= 300))
+		{
+			// Only do this if on-screen, otherwise static scenes which aren't re-rendering will release
+			// text objects that are on-screen.
+			var layer = this.layer;
+            this.update_bbox();
+            var bbox = this.bbox;
+
+            if (bbox.right < layer.viewLeft || bbox.bottom < layer.viewTop || bbox.left > layer.viewRight || bbox.top > layer.viewBottom)
+			{
+				this.runtime.glwrap.deleteTexture(this.mytex);
+				this.mytex = null;
+				this.myctx = null;
+				this.mycanvas = null;
+			}
+		}
+	};
+	
+	instanceProto.onDestroy = function ()
+	{
+		// Remove references to allow GC to collect and save memory
+		this.myctx = null;
+		this.mycanvas = null;
+		
+		if (this.runtime.glwrap && this.mytex)
+			this.runtime.glwrap.deleteTexture(this.mytex);
+		
+		this.mytex = null;
+	};
+	
+	instanceProto.updateFont = function ()
+	{
+		this.pxHeight = Math.ceil((this.ptSize / 72.0) * 96.0) + 4;		// assume 96dpi...
+		
+		var styles = [];
+		if (this.isBold)
+			styles.push("bold");
+		if (this.isItalic)
+			styles.push("italic");
+		this.fontstyle = styles.join(" ");
+		
+		this.font = this.fontstyle + " " + this.ptSize.toString() + "pt '" + this.facename + "'";
+		this.text_changed = true;
+		this.runtime.redraw = true;
+	};
+
+	instanceProto.draw = function(ctx, glmode)
+	{
+		ctx.font = this.font;
+		ctx.textBaseline = "top";
+		ctx.fillStyle = this.color;
+		
+		ctx.globalAlpha = glmode ? 1 : this.opacity;
+
+		var myscale = 1;
+		
+		if (glmode)
+		{
+			myscale = this.layer.getScale();
+			ctx.save();
+			ctx.scale(myscale, myscale);
+		}
+		
+		// If text has changed, run the word wrap.
+		if (this.text_changed || this.width !== this.lastwrapwidth)
+		{
+			this.type.plugin.WordWrap(this.text, this.lines, ctx, this.width, this.wrapbyword);
+			this.text_changed = false;
+			this.lastwrapwidth = this.width;
+		}
+		
+		// Draw each line after word wrap
+		this.update_bbox();
+		var penX = glmode ? 0 : this.bquad.tlx;
+		var penY = glmode ? 0 : this.bquad.tly;
+		
+		if (this.runtime.pixel_rounding)
+		{
+			penX = (penX + 0.5) | 0;
+			penY = (penY + 0.5) | 0;
+		}
+		
+		if (this.angle !== 0 && !glmode)
+		{
+			ctx.save();
+			ctx.translate(penX, penY);
+			ctx.rotate(this.angle);
+			penX = 0;
+			penY = 0;
+		}
+		
+		var endY = penY + this.height;
+		var line_height = this.pxHeight;
+		line_height += this.line_height_offset;
+		var drawX;
+		var i;
+		
+		// Adjust penY for vertical alignment
+		if (this.valign === 1)		// center
+			penY += Math.max(this.height / 2 - (this.lines.length * line_height) / 2, 0);
+		else if (this.valign === 2)	// bottom
+			penY += Math.max(this.height - (this.lines.length * line_height) - 2, 0);
+		
+		for (i = 0; i < this.lines.length; i++)
+		{
+			// Adjust the line draw position depending on alignment
+			drawX = penX;
+			
+			if (this.halign === 1)		// center
+				drawX = penX + (this.width - this.lines[i].width) / 2;
+			else if (this.halign === 2)	// right
+				drawX = penX + (this.width - this.lines[i].width);
+				
+			ctx.fillText(this.lines[i].text, drawX, penY);
+			penY += line_height;
+			
+			if (penY >= endY - line_height)
+				break;
+		}
+		
+		if (this.angle !== 0 || glmode)
+			ctx.restore();
+			
+		this.last_render_tick = this.runtime.tickcount;
+	};
+	
+	instanceProto.drawGL = function(glw)
+	{
+		if (this.width < 1 || this.height < 1)
+			return;
+		
+		var need_redraw = this.text_changed || this.need_text_redraw;
+		this.need_text_redraw = false;
+		var layer_scale = this.layer.getScale();
+		var layer_angle = this.layer.getAngle();
+		var rcTex = this.rcTex;
+		
+		// Calculate size taking in to account scale
+		var floatscaledwidth = layer_scale * this.width;
+		var floatscaledheight = layer_scale * this.height;
+		var scaledwidth = Math.ceil(floatscaledwidth);
+		var scaledheight = Math.ceil(floatscaledheight);
+		
+		var halfw = this.runtime.draw_width / 2;
+		var halfh = this.runtime.draw_height / 2;
+		
+		// Create 2D context for this instance if not already
+		if (!this.myctx)
+		{
+			this.mycanvas = document.createElement("canvas");
+			this.mycanvas.width = scaledwidth;
+			this.mycanvas.height = scaledheight;
+			this.lastwidth = scaledwidth;
+			this.lastheight = scaledheight;
+			need_redraw = true;
+			this.myctx = this.mycanvas.getContext("2d");
+		}
+		
+		// Update size if changed
+		if (scaledwidth !== this.lastwidth || scaledheight !== this.lastheight)
+		{
+			this.mycanvas.width = scaledwidth;
+			this.mycanvas.height = scaledheight;
+			
+			if (this.mytex)
+			{
+				glw.deleteTexture(this.mytex);
+				this.mytex = null;
+			}
+			
+			need_redraw = true;
+		}
+		
+		// Need to update the GL texture
+		if (need_redraw)
+		{
+			// Draw to my context
+			this.myctx.clearRect(0, 0, scaledwidth, scaledheight);
+			this.draw(this.myctx, true);
+			
+			// Create GL texture if none exists
+			// Create 16-bit textures (RGBA4) on mobile to reduce memory usage - quality impact on desktop
+			// was almost imperceptible
+			if (!this.mytex)
+				this.mytex = glw.createEmptyTexture(scaledwidth, scaledheight, this.runtime.linearSampling, this.runtime.isMobile);
+				
+			// Copy context to GL texture
+			glw.videoToTexture(this.mycanvas, this.mytex, this.runtime.isMobile);
+		}
+		
+		this.lastwidth = scaledwidth;
+		this.lastheight = scaledheight;
+		
+		// Draw GL texture
+		glw.setTexture(this.mytex);
+		glw.setOpacity(this.opacity);
+		
+		glw.resetModelView();
+		glw.translate(-halfw, -halfh);
+		glw.updateModelView();
+		
+		var q = this.bquad;
+		
+		var tlx = this.layer.layerToCanvas(q.tlx, q.tly, true, true);
+		var tly = this.layer.layerToCanvas(q.tlx, q.tly, false, true);
+		var trx = this.layer.layerToCanvas(q.trx, q.try_, true, true);
+		var try_ = this.layer.layerToCanvas(q.trx, q.try_, false, true);
+		var brx = this.layer.layerToCanvas(q.brx, q.bry, true, true);
+		var bry = this.layer.layerToCanvas(q.brx, q.bry, false, true);
+		var blx = this.layer.layerToCanvas(q.blx, q.bly, true, true);
+		var bly = this.layer.layerToCanvas(q.blx, q.bly, false, true);
+		
+		if (this.runtime.pixel_rounding || (this.angle === 0 && layer_angle === 0))
+		{
+			var ox = ((tlx + 0.5) | 0) - tlx;
+			var oy = ((tly + 0.5) | 0) - tly
+			
+			tlx += ox;
+			tly += oy;
+			trx += ox;
+			try_ += oy;
+			brx += ox;
+			bry += oy;
+			blx += ox;
+			bly += oy;
+		}
+		
+		if (this.angle === 0 && layer_angle === 0)
+		{
+			trx = tlx + scaledwidth;
+			try_ = tly;
+			brx = trx;
+			bry = tly + scaledheight;
+			blx = tlx;
+			bly = bry;
+			rcTex.right = 1;
+			rcTex.bottom = 1;
+		}
+		else
+		{
+			rcTex.right = floatscaledwidth / scaledwidth;
+			rcTex.bottom = floatscaledheight / scaledheight;
+		}
+		
+		glw.quadTex(tlx, tly, trx, try_, brx, bry, blx, bly, rcTex);
+		
+		glw.resetModelView();
+		glw.scale(layer_scale, layer_scale);
+		glw.rotateZ(-this.layer.getAngle());
+		glw.translate((this.layer.viewLeft + this.layer.viewRight) / -2, (this.layer.viewTop + this.layer.viewBottom) / -2);
+		glw.updateModelView();
+		
+		this.last_render_tick = this.runtime.tickcount;
+	};
+	
+	var wordsCache = [];
+
+	pluginProto.TokeniseWords = function (text)
+	{
+		cr.clearArray(wordsCache);
+		var cur_word = "";
+		var ch;
+		
+		// Loop every char
+		var i = 0;
+		
+		while (i < text.length)
+		{
+			ch = text.charAt(i);
+			
+			if (ch === "\n")
+			{
+				// Dump current word if any
+				if (cur_word.length)
+				{
+					wordsCache.push(cur_word);
+					cur_word = "";
+				}
+				
+				// Add newline word
+				wordsCache.push("\n");
+				
+				++i;
+			}
+			// Whitespace or hyphen: swallow rest of whitespace and include in word
+			else if (ch === " " || ch === "\t" || ch === "-")
+			{
+				do {
+					cur_word += text.charAt(i);
+					i++;
+				}
+				while (i < text.length && (text.charAt(i) === " " || text.charAt(i) === "\t"));
+				
+				wordsCache.push(cur_word);
+				cur_word = "";
+			}
+			else if (i < text.length)
+			{
+				cur_word += ch;
+				i++;
+			}
+		}
+		
+		// Append leftover word if any
+		if (cur_word.length)
+			wordsCache.push(cur_word);
+	};
+	
+	var linesCache = [];
+	
+	function allocLine()
+	{
+		if (linesCache.length)
+			return linesCache.pop();
+		else
+			return {};
+	};
+	
+	function freeLine(l)
+	{
+		linesCache.push(l);
+	};
+	
+	function freeAllLines(arr)
+	{
+		var i, len;
+		for (i = 0, len = arr.length; i < len; i++)
+		{
+			freeLine(arr[i]);
+		}
+		
+		cr.clearArray(arr);
+	};
+
+	pluginProto.WordWrap = function (text, lines, ctx, width, wrapbyword)
+	{
+		if (!text || !text.length)
+		{
+			freeAllLines(lines);
+			return;
+		}
+			
+		if (width <= 2.0)
+		{
+			freeAllLines(lines);
+			return;
+		}
+		
+		// If under 100 characters (i.e. a fairly short string), try a short string optimisation: just measure the text
+		// and see if it fits on one line, without going through the tokenise/wrap.
+		// Text musn't contain a linebreak!
+		if (text.length <= 100 && text.indexOf("\n") === -1)
+		{
+			var all_width = ctx.measureText(text).width;
+			
+			if (all_width <= width)
+			{
+				// fits on one line
+				freeAllLines(lines);
+				lines.push(allocLine());
+				lines[0].text = text;
+				lines[0].width = all_width;
+				return;
+			}
+		}
+			
+		this.WrapText(text, lines, ctx, width, wrapbyword);
+	};
+	
+	function trimSingleSpaceRight(str)
+	{
+		if (!str.length || str.charAt(str.length - 1) !== " ")
+			return str;
+		
+		return str.substring(0, str.length - 1);
+	};
+
+	pluginProto.WrapText = function (text, lines, ctx, width, wrapbyword)
+	{
+		var wordArray;
+		
+		if (wrapbyword)
+		{
+			this.TokeniseWords(text);	// writes to wordsCache
+			wordArray = wordsCache;
+		}
+		else
+			wordArray = text;
+			
+		var cur_line = "";
+		var prev_line;
+		var line_width;
+		var i;
+		var lineIndex = 0;
+		var line;
+		
+		for (i = 0; i < wordArray.length; i++)
+		{
+			// Look for newline
+			if (wordArray[i] === "\n")
+			{
+				// Flush line.  Recycle a line if possible
+				if (lineIndex >= lines.length)
+					lines.push(allocLine());
+				
+				cur_line = trimSingleSpaceRight(cur_line);		// for correct center/right alignment
+				line = lines[lineIndex];
+				line.text = cur_line;
+				line.width = ctx.measureText(cur_line).width;
+					
+				lineIndex++;
+				cur_line = "";
+				continue;
+			}
+			
+			// Otherwise add to line
+			prev_line = cur_line;
+			cur_line += wordArray[i];
+			
+			// Measure line. Trim right to prevent wrapping due to a space on the end.
+			line_width = ctx.measureText(trimSingleSpaceRight(cur_line)).width;
+			
+			// Line too long: wrap the line before this word was added
+			if (line_width >= width)
+			{
+				// Append the last line's width to the string object
+				if (lineIndex >= lines.length)
+					lines.push(allocLine());
+				
+				prev_line = trimSingleSpaceRight(prev_line);
+				line = lines[lineIndex];
+				line.text = prev_line;
+				line.width = ctx.measureText(prev_line).width;
+					
+				lineIndex++;
+				cur_line = wordArray[i];
+				
+				// Wrapping by character: avoid lines starting with spaces
+				if (!wrapbyword && cur_line === " ")
+					cur_line = "";
+			}
+		}
+		
+		// Add any leftover line
+		if (cur_line.length)
+		{
+			if (lineIndex >= lines.length)
+				lines.push(allocLine());
+			
+			cur_line = trimSingleSpaceRight(cur_line);
+			line = lines[lineIndex];
+			line.text = cur_line;
+			line.width = ctx.measureText(cur_line).width;
+				
+			lineIndex++;
+		}
+		
+		// truncate lines to the number that were used. recycle any spare line objects
+		for (i = lineIndex; i < lines.length; i++)
+			freeLine(lines[i]);
+		
+		lines.length = lineIndex;
+	};
+	
+
+	//////////////////////////////////////
+	// Conditions
+	function Cnds() {};
+
+	Cnds.prototype.CompareText = function(text_to_compare, case_sensitive)
+	{
+		if (case_sensitive)
+			return this.text == text_to_compare;
+		else
+			return cr.equals_nocase(this.text, text_to_compare);
+	};
+	
+	pluginProto.cnds = new Cnds();
+
+	//////////////////////////////////////
+	// Actions
+	function Acts() {};
+
+	Acts.prototype.SetText = function(param)
+	{
+		if (cr.is_number(param) && param < 1e9)
+			param = Math.round(param * 1e10) / 1e10;	// round to nearest ten billionth - hides floating point errors
+		
+		var text_to_set = param.toString();
+		
+		if (this.text !== text_to_set)
+		{
+			this.text = text_to_set;
+			this.text_changed = true;
+			this.runtime.redraw = true;
+		}
+	};
+	
+	Acts.prototype.AppendText = function(param)
+	{
+		if (cr.is_number(param))
+			param = Math.round(param * 1e10) / 1e10;	// round to nearest ten billionth - hides floating point errors
+			
+		var text_to_append = param.toString();
+		
+		if (text_to_append)	// not empty
+		{
+			this.text += text_to_append;
+			this.text_changed = true;
+			this.runtime.redraw = true;
+		}
+	};
+	
+	Acts.prototype.SetFontFace = function (face_, style_)
+	{
+		var newstyle = "";
+		var newbold = false;
+		var newitalic = false;
+		
+		switch (style_) {
+		case 1: newbold = true; break;
+		case 2: newitalic = true; break;
+		case 3: newbold = true; newitalic = true; break;
+		}
+		
+		if (face_ === this.facename && this.isBold === newbold && this.isItalic === newitalic)
+			return;		// no change
+			
+		this.facename = face_;
+		this.isBold = newbold;
+		this.isItalic = newitalic;
+		this.updateFont();
+	};
+	
+	Acts.prototype.SetFontSize = function (size_)
+	{
+		if (this.ptSize === size_)
+			return;
+
+		this.ptSize = size_;
+		this.updateFont();
+	};
+	
+	Acts.prototype.SetFontColor = function (rgb)
+	{
+		var r = cr.clamp(Math.floor(cr.GetRValue(rgb) * 255), 0, 255);
+		var g = cr.clamp(Math.floor(cr.GetGValue(rgb) * 255), 0, 255);
+		var b = cr.clamp(Math.floor(cr.GetBValue(rgb) * 255), 0, 255);
+
+		var newcolor = "rgb(" + r + "," + g + "," + b + ")";
+		
+		if (newcolor === this.color)
+			return;
+
+		this.color = newcolor;
+		this.need_text_redraw = true;
+		this.runtime.redraw = true;
+	};
+	
+	Acts.prototype.SetWebFont = function (familyname_, cssurl_)
+	{
+		var self = this;
+		var refreshFunc = (function () {
+							self.runtime.redraw = true;
+							self.text_changed = true;
+						});
+
+		// Already requested this web font?
+		if (requestedWebFonts.hasOwnProperty(cssurl_))
+		{
+			// Use it immediately without requesting again.  Whichever object
+			// made the original request will refresh the canvas when it finishes
+			// loading.
+			var newfacename = "'" + familyname_ + "'";
+			
+			if (this.facename === newfacename)
+				return;	// no change
+				
+			this.facename = newfacename;
+			this.updateFont();
+			
+			// There doesn't seem to be a good way to test if the font has loaded,
+			// so just fire a refresh every 100ms for the first 1 second, then
+			// every 1 second after that up to 10 sec - hopefully will have loaded by then!
+			for (var i = 1; i < 10; i++)
+			{
+				setTimeout(refreshFunc, i * 100);
+				setTimeout(refreshFunc, i * 1000);
+			}
+		
+			return;
+		}
+		
+		// Otherwise start loading the web font now
+		var wf = document.createElement("link");
+		wf.href = cssurl_;
+		wf.rel = "stylesheet";
+		wf.type = "text/css";
+		wf.onload = refreshFunc;
+					
+		document.getElementsByTagName('head')[0].appendChild(wf);
+		requestedWebFonts[cssurl_] = true;
+		
+		this.facename = "'" + familyname_ + "'";
+		this.updateFont();
+					
+		// Another refresh hack
+		for (var i = 1; i < 10; i++)
+		{
+			setTimeout(refreshFunc, i * 100);
+			setTimeout(refreshFunc, i * 1000);
+		}
+		
+;
+	};
+	
+	Acts.prototype.SetEffect = function (effect)
+	{
+		this.blend_mode = effect;
+		this.compositeOp = cr.effectToCompositeOp(effect);
+		cr.setGLBlend(this, effect, this.runtime.gl);
+		this.runtime.redraw = true;
+	};
+
+	pluginProto.acts = new Acts();
+	
+	//////////////////////////////////////
+	// Expressions
+	function Exps() {};
+
+	Exps.prototype.Text = function(ret)
+	{
+		ret.set_string(this.text);
+	};
+	
+	Exps.prototype.FaceName = function (ret)
+	{
+		ret.set_string(this.facename);
+	};
+	
+	Exps.prototype.FaceSize = function (ret)
+	{
+		ret.set_int(this.ptSize);
+	};
+	
+	Exps.prototype.TextWidth = function (ret)
+	{
+		var w = 0;
+		var i, len, x;
+		for (i = 0, len = this.lines.length; i < len; i++)
+		{
+			x = this.lines[i].width;
+			
+			if (w < x)
+				w = x;
+		}
+		
+		ret.set_int(w);
+	};
+	
+	Exps.prototype.TextHeight = function (ret)
+	{
+		ret.set_int(this.lines.length * (this.pxHeight + this.line_height_offset) - this.line_height_offset);
+	};
+	
+	pluginProto.exps = new Exps();
+		
+}());
+
+// Barra de progresso
+// ECMAScript 5 strict mode
+
+;
+;
+
+/////////////////////////////////////
+// Plugin class
+cr.plugins_.progressbar = function(runtime)
 {
 	this.runtime = runtime;
 };
@@ -23794,7 +24642,7 @@ cr.plugins_.Particles = function(runtime)
 (function ()
 {
 	/////////////////////////////////////
-	var pluginProto = cr.plugins_.Particles.prototype;
+	var pluginProto = cr.plugins_.progressbar.prototype;
 		
 	/////////////////////////////////////
 	// Object type class
@@ -23809,248 +24657,6 @@ cr.plugins_.Particles = function(runtime)
 	// called on startup for each object type
 	typeProto.onCreate = function()
 	{
-		if (this.is_family)
-			return;
-		
-		this.texture_img = this.runtime.findWaitingTexture(this.texture_file);
-		
-		if (!this.texture_img)
-		{
-			this.texture_img = new Image();
-			this.texture_img.cr_src = this.texture_file;
-			this.texture_img.cr_filesize = this.texture_filesize;
-			this.texture_img.c2webGL_texture = null;
-			this.runtime.waitForImageLoad(this.texture_img, this.texture_file);
-		}
-		
-		this.spriteX = this.texture_data[3];
-		this.spriteY = this.texture_data[4];
-		this.spriteWidth = this.texture_data[5];
-		this.spriteHeight = this.texture_data[6];
-	};
-	
-	typeProto.onLostWebGLContext = function ()
-	{
-		if (this.is_family)
-			return;
-			
-		this.webGL_texture = null;
-	};
-	
-	typeProto.createParticleTexture = function ()
-	{
-		// Shortcut to correctly render spritesheeted particle in WebGL: cut the image out of its spritesheet
-		// and create a texture from that. TODO: render directly from spritesheet texture via texture coords.
-		var tmpcanvas = document.createElement("canvas");
-		var w = this.spriteWidth;
-		var h = this.spriteHeight;
-		tmpcanvas.width = w;
-		tmpcanvas.height = h;
-		var tmpctx = tmpcanvas.getContext("2d");
-		tmpctx.drawImage(this.texture_img, this.spriteX, this.spriteY, w, h, 0, 0, w, h);
-		
-		this.webGL_texture = this.runtime.glwrap.loadTexture(tmpcanvas, true, this.runtime.linearSampling, this.texture_pixelformat);
-	};
-	
-	typeProto.onRestoreWebGLContext = function ()
-	{
-		// No need to create textures if no instances exist, will create on demand
-		if (this.is_family || !this.instances.length)
-			return;
-		
-		if (!this.webGL_texture)
-		{
-			this.createParticleTexture();
-		}
-	};
-	
-	typeProto.loadTextures = function ()
-	{
-		if (this.is_family || this.webGL_texture || !this.runtime.glwrap)
-			return;
-		
-		this.createParticleTexture();
-	};
-	
-	typeProto.unloadTextures = function ()
-	{
-		if (this.is_family || this.instances.length || !this.webGL_texture)
-			return;
-
-		this.runtime.glwrap.deleteTexture(this.webGL_texture);
-		this.webGL_texture = null;
-	};
-	
-	typeProto.preloadCanvas2D = function (ctx)
-	{
-		// draw to preload, browser should lazy load the texture
-		ctx.drawImage(this.texture_img, 0, 0);
-	};
-	
-	/////////////////////////////////////
-	// Particle class
-	function Particle(owner)
-	{
-		this.owner = owner;
-		this.active = false;
-		this.x = 0;
-		this.y = 0;
-		this.speed = 0;
-		this.angle = 0;
-		this.opacity = 1;
-		this.grow = 0;
-		this.size = 0;
-		this.gs = 0;			// gravity speed
-		this.age = 0;
-		cr.seal(this);
-	};
-	
-	Particle.prototype.init = function ()
-	{
-		var owner = this.owner;
-		this.x = owner.x - (owner.xrandom / 2) + (Math.random() * owner.xrandom);
-		this.y = owner.y - (owner.yrandom / 2) + (Math.random() * owner.yrandom);
-		
-		this.speed = owner.initspeed - (owner.speedrandom / 2) + (Math.random() * owner.speedrandom);
-		this.angle = owner.angle - (owner.spraycone / 2) + (Math.random() * owner.spraycone);
-		this.opacity = owner.initopacity;
-		this.size = owner.initsize - (owner.sizerandom / 2) + (Math.random() * owner.sizerandom);
-		this.grow = owner.growrate - (owner.growrandom / 2) + (Math.random() * owner.growrandom);
-		this.gs = 0;
-		this.age = 0;
-	};
-	
-	Particle.prototype.tick = function (dt)
-	{
-		var owner = this.owner;
-		
-		// Move
-		this.x += Math.cos(this.angle) * this.speed * dt;
-		this.y += Math.sin(this.angle) * this.speed * dt;
-		
-		// Apply gravity
-		this.y += this.gs * dt;
-		
-		// Adjust lifetime parameters
-		this.speed += owner.acc * dt;
-		this.size += this.grow * dt;
-		this.gs += owner.g * dt;
-		this.age += dt;
-		
-		// Destroy particle if shrunk to less than a pixel in size
-		if (this.size < 1)
-		{
-			this.active = false;
-			return;
-		}
-		
-		if (owner.lifeanglerandom !== 0)
-			this.angle += (Math.random() * owner.lifeanglerandom * dt) - (owner.lifeanglerandom * dt / 2);
-			
-		if (owner.lifespeedrandom !== 0)
-			this.speed += (Math.random() * owner.lifespeedrandom * dt) - (owner.lifespeedrandom * dt / 2);
-			
-		if (owner.lifeopacityrandom !== 0)
-		{
-			this.opacity += (Math.random() * owner.lifeopacityrandom * dt) - (owner.lifeopacityrandom * dt / 2);
-			
-			if (this.opacity < 0)
-				this.opacity = 0;
-			else if (this.opacity > 1)
-				this.opacity = 1;
-		}
-		
-		// Make inactive after timeout for both fade and timeout settings
-		if (owner.destroymode <= 1 && this.age >= owner.timeout)
-		{
-			this.active = false;
-		}
-		// Or make inactive when stopped
-		if (owner.destroymode === 2 && this.speed <= 0)
-		{
-			this.active = false;
-		}
-	};
-	
-	Particle.prototype.draw = function (ctx)
-	{
-		var curopacity = this.owner.opacity * this.opacity;
-		
-		if (curopacity === 0)
-			return;
-		
-		// Modify opacity for fade-out
-		if (this.owner.destroymode === 0)
-			curopacity *= 1 - (this.age / this.owner.timeout);
-			
-		ctx.globalAlpha = curopacity;
-			
-		var drawx = this.x - this.size / 2;
-		var drawy = this.y - this.size / 2;
-		
-		if (this.owner.runtime.pixel_rounding)
-		{
-			drawx = (drawx + 0.5) | 0;
-			drawy = (drawy + 0.5) | 0;
-		}
-		
-		var type = this.owner.type;
-		ctx.drawImage(type.texture_img, type.spriteX, type.spriteY, type.spriteWidth, type.spriteHeight, drawx, drawy, this.size, this.size);
-	};
-	
-	Particle.prototype.drawGL = function (glw)
-	{
-		var curopacity = this.owner.opacity * this.opacity;
-		
-		// Modify opacity for fade-out
-		if (this.owner.destroymode === 0)
-			curopacity *= 1 - (this.age / this.owner.timeout);
-		
-		var drawsize = this.size;
-		var scaleddrawsize = drawsize * this.owner.particlescale;
-		var drawx = this.x - drawsize / 2;
-		var drawy = this.y - drawsize / 2;
-		
-		if (this.owner.runtime.pixel_rounding)
-		{
-			drawx = (drawx + 0.5) | 0;
-			drawy = (drawy + 0.5) | 0;
-		}
-		
-		// Don't bother issuing a quad for a particle smaller than 1px, it probably won't be visible anyway.
-		if (scaleddrawsize < 1 || curopacity === 0)
-			return;
-			
-		// Quad if outside the allowed point range, otherwise issue a point.  Hopefully there won't be too much
-		// quad <-> point batch switching.  Note we have to manually scale particles which don't take in to account
-		// the layout zoom etc. otherwise.
-		if (scaleddrawsize < glw.minPointSize || scaleddrawsize > glw.maxPointSize)
-		{
-			glw.setOpacity(curopacity);
-			glw.quad(drawx, drawy, drawx + drawsize, drawy, drawx + drawsize, drawy + drawsize, drawx, drawy + drawsize);
-		}
-		else
-			glw.point(this.x, this.y, scaleddrawsize, curopacity);
-	};
-	
-	Particle.prototype.left = function ()
-	{
-		return this.x - this.size / 2;
-	};
-	
-	Particle.prototype.right = function ()
-	{
-		return this.x + this.size / 2;
-	};
-	
-	Particle.prototype.top = function ()
-	{
-		return this.y - this.size / 2;
-	};
-	
-	Particle.prototype.bottom = function ()
-	{
-		return this.y + this.size / 2;
 	};
 
 	/////////////////////////////////////
@@ -24062,304 +24668,199 @@ cr.plugins_.Particles = function(runtime)
 	};
 	
 	var instanceProto = pluginProto.Instance.prototype;
-	
-	// global array of particles to recycle
-	var deadparticles = [];
 
 	// called whenever an instance is created
 	instanceProto.onCreate = function()
 	{
-		var props = this.properties;
+		// elem must be the label wrapper if a checkbox, otherwise is same as input elem
+		this.elem = document.createElement("progress");
 		
-		this.rate = props[0];
-		this.spraycone = cr.to_radians(props[1]);
-		this.spraytype = props[2];			// 0 = continuous, 1 = one-shot
-		this.spraying = true;				// for continuous mode only
+		this.value = this.properties[0];
+		this.max = this.properties[1];
 		
-		this.initspeed = props[3];
-		this.initsize = props[4];
-		this.initopacity = props[5] / 100.0;
-		this.growrate = props[6];
-		this.xrandom = props[7];
-		this.yrandom = props[8];
-		this.speedrandom = props[9];
-		this.sizerandom = props[10];
-		this.growrandom = props[11];
-		this.acc = props[12];
-		this.g = props[13];
-		this.lifeanglerandom = props[14];
-		this.lifespeedrandom = props[15];
-		this.lifeopacityrandom = props[16];
-		this.destroymode = props[17];		// 0 = fade, 1 = timeout, 2 = stopped
-		this.timeout = props[18];
-		
-		this.particleCreateCounter = 0;
-		this.particlescale = 1;
-		
-		// Dynamically set the bounding box to surround all created particles
-		this.particleBoxLeft = this.x;
-		this.particleBoxTop = this.y;
-		this.particleBoxRight = this.x;
-		this.particleBoxBottom = this.y;
-		
-		this.add_bbox_changed_callback(function (self) {
-			self.bbox.set(self.particleBoxLeft, self.particleBoxTop, self.particleBoxRight, self.particleBoxBottom);
-			self.bquad.set_from_rect(self.bbox);
-			self.bbox_changed = false;
-			self.update_collision_cell();
-			self.update_render_cell();
-		});
-		
-		// Check for recycling
-		if (!this.recycled)
-			this.particles = [];
-		
-		this.runtime.tickMe(this);
-		
-		this.type.loadTextures();
-			
-		// If in one-shot mode, create all particles now
-		if (this.spraytype === 1)
+		// Determinate
+		if (this.max > 0 && this.value >= 0)
 		{
-			for (var i = 0; i < this.rate; i++)
-				this.allocateParticle().opacity = 0;
+			this.elem["max"] = this.max;
+			this.elem["value"] = this.value;
 		}
 		
-		this.first_tick = true;		// for re-init'ing one-shot particles on first tick so they assume any new angle/position
+		this.elem.id = this.properties[4];
+		this.elem.title = this.properties[2];
+		document.body.appendChild(this.elem);
+		
+		this.element_hidden = false;
+		
+		if (!this.properties[3])
+		{
+			this.elem.style.display = "none";
+			this.visible = false;
+			this.element_hidden = true;
+		}
+		
+		this.elem.onclick = (function (self) {
+			return function(e) {
+				e.stopPropagation();
+				
+				self.runtime.isInUserInputEvent = true;
+				self.runtime.trigger(cr.plugins_.progressbar.prototype.cnds.OnClicked, self);
+				self.runtime.isInUserInputEvent = false;
+			};
+		})(this);
+		
+		// Prevent touches reaching the canvas
+		this.elem.addEventListener("touchstart", function (e) {
+			e.stopPropagation();
+		}, false);
+		
+		this.elem.addEventListener("touchmove", function (e) {
+			e.stopPropagation();
+		}, false);
+		
+		this.elem.addEventListener("touchend", function (e) {
+			e.stopPropagation();
+		}, false);
+		
+		// Prevent clicks being blocked
+		this.elem.addEventListener("mousedown", function (e) {
+			e.stopPropagation();
+		});
+		
+		this.elem.addEventListener("mouseup", function (e) {
+			e.stopPropagation();
+		});
+		
+		this.lastLeft = 0;
+		this.lastTop = 0;
+		this.lastRight = 0;
+		this.lastBottom = 0;
+		this.lastWinWidth = 0;
+		this.lastWinHeight = 0;
+			
+		this.updatePosition(true);
+		
+		this.runtime.tickMe(this);
 	};
 	
 	instanceProto.saveToJSON = function ()
 	{
 		var o = {
-			"r": this.rate,
-			"sc": this.spraycone,
-			"st": this.spraytype,
-			"s": this.spraying,
-			"isp": this.initspeed,
-			"isz": this.initsize,
-			"io": this.initopacity,
-			"gr": this.growrate,
-			"xr": this.xrandom,
-			"yr": this.yrandom,
-			"spr": this.speedrandom,
-			"szr": this.sizerandom,
-			"grnd": this.growrandom,
-			"acc": this.acc,
-			"g": this.g,
-			"lar": this.lifeanglerandom,
-			"lsr": this.lifespeedrandom,
-			"lor": this.lifeopacityrandom,
-			"dm": this.destroymode,
-			"to": this.timeout,
-			"pcc": this.particleCreateCounter,
-			"ft": this.first_tick,
-			"p": []
+			"v": this.elem["value"],
+			"m": this.elem["max"]
 		};
-		
-		var i, len, p;
-		var arr = o["p"];
-
-		for (i = 0, len = this.particles.length; i < len; i++)
-		{
-			p = this.particles[i];
-			arr.push([p.x, p.y, p.speed, p.angle, p.opacity, p.grow, p.size, p.gs, p.age]);
-		}
 		
 		return o;
 	};
 	
 	instanceProto.loadFromJSON = function (o)
 	{
-		this.rate = o["r"];
-		this.spraycone = o["sc"];
-		this.spraytype = o["st"];
-		this.spraying = o["s"];
-		this.initspeed = o["isp"];
-		this.initsize = o["isz"];
-		this.initopacity = o["io"];
-		this.growrate = o["gr"];
-		this.xrandom = o["xr"];
-		this.yrandom = o["yr"];
-		this.speedrandom = o["spr"];
-		this.sizerandom = o["szr"];
-		this.growrandom = o["grnd"];
-		this.acc = o["acc"];
-		this.g = o["g"];
-		this.lifeanglerandom = o["lar"];
-		this.lifespeedrandom = o["lsr"];
-		this.lifeopacityrandom = o["lor"];
-		this.destroymode = o["dm"];
-		this.timeout = o["to"];
-		this.particleCreateCounter = o["pcc"];
-		this.first_tick = o["ft"];
-		
-		// recycle all particles then load by reallocating them
-		deadparticles.push.apply(deadparticles, this.particles);
-		cr.clearArray(this.particles);
-		
-		var i, len, p, d;
-		var arr = o["p"];
-		
-		for (i = 0, len = arr.length; i < len; i++)
-		{
-			p = this.allocateParticle();
-			d = arr[i];
-			p.x = d[0];
-			p.y = d[1];
-			p.speed = d[2];
-			p.angle = d[3];
-			p.opacity = d[4];
-			p.grow = d[5];
-			p.size = d[6];
-			p.gs = d[7];
-			p.age = d[8];
-		}
+		this.elem["value"] = o["v"];
+		this.elem["max"] = o["m"];
 	};
 	
 	instanceProto.onDestroy = function ()
 	{
-		// recycle all particles
-		deadparticles.push.apply(deadparticles, this.particles);
-		cr.clearArray(this.particles);
+		this.elem.parentElement.removeChild(this.elem);
+		this.elem = null;
 	};
 	
-	instanceProto.allocateParticle = function ()
+	instanceProto.tick = function ()
 	{
-		var p;
-		
-		if (deadparticles.length)
-		{
-			p = deadparticles.pop();
-			p.owner = this;
-		}
-		else
-			p = new Particle(this);
-		
-		this.particles.push(p);
-		p.active = true;
-		return p;
+		this.updatePosition();
 	};
 	
-	instanceProto.tick = function()
+	var last_canvas_offset = null;
+	var last_checked_tick = -1;
+	
+	instanceProto.updatePosition = function (first)
 	{
-		var dt = this.runtime.getDt(this);
+		var left = this.layer.layerToCanvas(this.x, this.y, true);
+		var top = this.layer.layerToCanvas(this.x, this.y, false);
+		var right = this.layer.layerToCanvas(this.x + this.width, this.y + this.height, true);
+		var bottom = this.layer.layerToCanvas(this.x + this.width, this.y + this.height, false);
 		
-		var i, len, p, n, j;
+		var rightEdge = this.runtime.width / this.runtime.devicePixelRatio;
+		var bottomEdge = this.runtime.height / this.runtime.devicePixelRatio;
 		
-		// Create spray particles for this tick
-		if (this.spraytype === 0 && this.spraying)
+		// Is entirely offscreen or invisible: hide
+		if (!this.visible || !this.layer.visible || right <= 0 || bottom <= 0 || left >= rightEdge || top >= bottomEdge)
 		{
-			this.particleCreateCounter += dt * this.rate;
+			if (!this.element_hidden)
+				this.elem.style.display = "none";
 			
-			n = cr.floor(this.particleCreateCounter);
-			this.particleCreateCounter -= n;
-			
-			for (i = 0; i < n; i++)
-			{
-				p = this.allocateParticle();
-				p.init();
-			}
+			this.element_hidden = true;
+			return;
 		}
 		
-		this.particleBoxLeft = this.x;
-		this.particleBoxTop = this.y;
-		this.particleBoxRight = this.x;
-		this.particleBoxBottom = this.y;
+		// Truncate to canvas size
+		if (left < 1)
+			left = 1;
+		if (top < 1)
+			top = 1;
+		if (right >= rightEdge)
+			right = rightEdge - 1;
+		if (bottom >= bottomEdge)
+			bottom = bottomEdge - 1;
 		
-		for (i = 0, j = 0, len = this.particles.length; i < len; i++)
+		var curWinWidth = window.innerWidth;
+		var curWinHeight = window.innerHeight;
+			
+		// Avoid redundant updates
+		if (!first && this.lastLeft === left && this.lastTop === top && this.lastRight === right && this.lastBottom === bottom && this.lastWinWidth === curWinWidth && this.lastWinHeight === curWinHeight)
 		{
-			p = this.particles[i];
-			this.particles[j] = p;
-			
-			this.runtime.redraw = true;
-			
-			// If the first tick for one-shot particles, call init() now so the particles
-			// assume any changed position or angle of the Particles object.
-			if (this.spraytype === 1 && this.first_tick)
-				p.init();
-			
-			p.tick(dt);
-			
-			// Particle is dead: move to deadparticles for later recycling
-			if (!p.active)
+			if (this.element_hidden)
 			{
-				deadparticles.push(p);
-				continue;
+				this.elem.style.display = "";
+				this.element_hidden = false;
 			}
 			
-			// measure bounding box
-			if (p.left() < this.particleBoxLeft)
-				this.particleBoxLeft = p.left();
-			if (p.right() > this.particleBoxRight)
-				this.particleBoxRight = p.right();
-			if (p.top() < this.particleBoxTop)
-				this.particleBoxTop = p.top();
-			if (p.bottom() > this.particleBoxBottom)
-				this.particleBoxBottom = p.bottom();
+			return;
+		}
 			
-			j++;
+		this.lastLeft = left;
+		this.lastTop = top;
+		this.lastRight = right;
+		this.lastBottom = bottom;
+		this.lastWinWidth = curWinWidth;
+		this.lastWinHeight = curWinHeight;
+		
+		if (this.element_hidden)
+		{
+			this.elem.style.display = "";
+			this.element_hidden = false;
 		}
 		
-		cr.truncateArray(this.particles, j);
-		
-		// Update the bounding box based on active particles
-		this.set_bbox_changed();
-		
-		this.first_tick = false;
-		
-		// If one-shot and all particles are dead, destroy the whole object
-		if (this.spraytype === 1 && this.particles.length === 0)
-			this.runtime.DestroyInstance(this);
+		var offx = Math.round(left) + this.runtime.canvas.offsetLeft;
+		var offy = Math.round(top) + this.runtime.canvas.offsetTop;
+		this.elem.style.position = "absolute";
+		this.elem.style.left = offx + "px";
+		this.elem.style.top = offy + "px";
+		this.elem.style.width = Math.round(right - left) + "px";
+		this.elem.style.height = Math.round(bottom - top) + "px";
 	};
 	
-	// only called if a layout object - draw to a canvas 2D context
-	instanceProto.draw = function (ctx)
+	// only called if a layout object
+	instanceProto.draw = function(ctx)
 	{
-		var i, len, p, layer = this.layer;
-		
-		for (i = 0, len = this.particles.length; i < len; i++)
-		{
-			p = this.particles[i];
-			
-			// Only draw active and on-screen particles
-			if (p.right() >= layer.viewLeft && p.bottom() >= layer.viewTop && p.left() <= layer.viewRight && p.top() <= layer.viewBottom)
-			{
-				p.draw(ctx);
-			}
-		}
 	};
 	
-	// only called if a layout object in WebGL mode - draw to the WebGL context
-	// 'glw' is not a WebGL context, it's a wrapper - you can find its methods in GLWrap.js in the install
-	// directory or just copy what other plugins do.
-	instanceProto.drawGL = function (glw)
+	instanceProto.drawGL = function(glw)
 	{
-		this.particlescale = this.layer.getScale();
-		glw.setTexture(this.type.webGL_texture);
-		
-		var i, len, p, layer = this.layer;
-		
-		for (i = 0, len = this.particles.length; i < len; i++)
-		{
-			p = this.particles[i];
-			
-			// Only draw active and on-screen particles
-			if (p.right() >= layer.viewLeft && p.bottom() >= layer.viewTop && p.left() <= layer.viewRight && p.top() <= layer.viewBottom)
-			{
-				p.drawGL(glw);
-			}
-		}
 	};
 	
 
 	//////////////////////////////////////
 	// Conditions
 	function Cnds() {};
-
-	// the example condition
-	Cnds.prototype.IsSpraying = function ()
+	
+	Cnds.prototype.OnClicked = function ()
 	{
-		return this.spraying;
+		return true;
+	};
+	
+	Cnds.prototype.CompareProgress = function (cmp, x)
+	{
+		return cr.do_cmp(this.elem["value"], cmp, x);
 	};
 	
 	pluginProto.cnds = new Cnds();
@@ -24368,124 +24869,39 @@ cr.plugins_.Particles = function(runtime)
 	// Actions
 	function Acts() {};
 
-	Acts.prototype.SetSpraying = function (set_)
+	Acts.prototype.SetTooltip = function (text)
 	{
-		this.spraying = (set_ !== 0);
+		this.elem.title = text;
 	};
 	
-	Acts.prototype.SetEffect = function (effect)
+	Acts.prototype.SetVisible = function (vis)
 	{
-		this.blend_mode = effect;
-		this.compositeOp = cr.effectToCompositeOp(effect);
-		cr.setGLBlend(this, effect, this.runtime.gl);
-		this.runtime.redraw = true;
+		this.visible = (vis !== 0);
 	};
 	
-	Acts.prototype.SetRate = function (x)
+	Acts.prototype.SetCSSStyle = function (p, v)
 	{
-		this.rate = x;
-		var diff, i;
-		
-		// In one-shot mode, if still in the first tick, adjust the number of particles created 
-		if (this.spraytype === 1 && this.first_tick)
-		{
-			// Reducing particle count
-			if (x < this.particles.length)
-			{
-				diff = this.particles.length - x;
-				
-				for (i = 0; i < diff; i++)
-					deadparticles.push(this.particles.pop());
-			}
-			// Increasing particle count
-			else if (x > this.particles.length)
-			{
-				diff = x - this.particles.length;
-				
-				for (i = 0; i < diff; i++)
-					this.allocateParticle().opacity = 0;
-			}
-		}
+		this.elem.style[cr.cssToCamelCase(p)] = v;
 	};
 	
-	Acts.prototype.SetSprayCone = function (x)
+	Acts.prototype.SetProgress = function (x)
 	{
-		this.spraycone = cr.to_radians(x);
+		this.value = x;
+		this.elem["max"] = this.max;
+		this.elem["value"] = this.value;
 	};
 	
-	Acts.prototype.SetInitSpeed = function (x)
+	Acts.prototype.SetMaximum = function (x)
 	{
-		this.initspeed = x;
+		this.max = x;
+		this.elem["max"] = this.max;
+		this.elem["value"] = this.value;
 	};
 	
-	Acts.prototype.SetInitSize = function (x)
+	Acts.prototype.SetIndeterminate = function ()
 	{
-		this.initsize = x;
-	};
-	
-	Acts.prototype.SetInitOpacity = function (x)
-	{
-		this.initopacity = x / 100;
-	};
-	
-	Acts.prototype.SetGrowRate = function (x)
-	{
-		this.growrate = x;
-	};
-	
-	Acts.prototype.SetXRandomiser = function (x)
-	{
-		this.xrandom = x;
-	};
-	
-	Acts.prototype.SetYRandomiser = function (x)
-	{
-		this.yrandom = x;
-	};
-	
-	Acts.prototype.SetSpeedRandomiser = function (x)
-	{
-		this.speedrandom = x;
-	};
-	
-	Acts.prototype.SetSizeRandomiser = function (x)
-	{
-		this.sizerandom = x;
-	};
-	
-	Acts.prototype.SetGrowRateRandomiser = function (x)
-	{
-		this.growrandom = x;
-	};
-	
-	Acts.prototype.SetParticleAcc = function (x)
-	{
-		this.acc = x;
-	};
-	
-	Acts.prototype.SetGravity = function (x)
-	{
-		this.g = x;
-	};
-	
-	Acts.prototype.SetAngleRandomiser = function (x)
-	{
-		this.lifeanglerandom = x;
-	};
-	
-	Acts.prototype.SetLifeSpeedRandomiser = function (x)
-	{
-		this.lifespeedrandom = x;
-	};
-	
-	Acts.prototype.SetOpacityRandomiser = function (x)
-	{
-		this.lifeopacityrandom = x;
-	};
-	
-	Acts.prototype.SetTimeout = function (x)
-	{
-		this.timeout = x;
+		this.elem.removeAttribute("value");
+		this.elem.removeAttribute("max");
 	};
 	
 	pluginProto.acts = new Acts();
@@ -24494,95 +24910,396 @@ cr.plugins_.Particles = function(runtime)
 	// Expressions
 	function Exps() {};
 	
-	Exps.prototype.ParticleCount = function (ret)
+	Exps.prototype.Progress = function (ret)
 	{
-		ret.set_int(this.particles.length);
+		ret.set_float(this.elem["value"]);
 	};
 	
-	Exps.prototype.Rate = function (ret)
+	Exps.prototype.Maximum = function (ret)
 	{
-		ret.set_float(this.rate);
+		ret.set_float(this.elem["max"]);
 	};
 	
-	Exps.prototype.SprayCone = function (ret)
+	pluginProto.exps = new Exps();
+
+}());
+
+// Botão
+// ECMAScript 5 strict mode
+
+;
+;
+
+/////////////////////////////////////
+// Plugin class
+cr.plugins_.Button = function(runtime)
+{
+	this.runtime = runtime;
+};
+
+(function ()
+{
+	/////////////////////////////////////
+	var pluginProto = cr.plugins_.Button.prototype;
+		
+	/////////////////////////////////////
+	// Object type class
+	pluginProto.Type = function(plugin)
 	{
-		ret.set_float(cr.to_degrees(this.spraycone));
+		this.plugin = plugin;
+		this.runtime = plugin.runtime;
+	};
+
+	var typeProto = pluginProto.Type.prototype;
+
+	// called on startup for each object type
+	typeProto.onCreate = function()
+	{
+	};
+
+	/////////////////////////////////////
+	// Instance class
+	pluginProto.Instance = function(type)
+	{
+		this.type = type;
+		this.runtime = type.runtime;
 	};
 	
-	Exps.prototype.InitSpeed = function (ret)
+	var instanceProto = pluginProto.Instance.prototype;
+
+	// called whenever an instance is created
+	instanceProto.onCreate = function()
 	{
-		ret.set_float(this.initspeed);
+		this.isCheckbox = (this.properties[0] === 1);
+		
+		this.inputElem = document.createElement("input");
+		
+		if (this.isCheckbox)
+			this.elem = document.createElement("label");
+		else
+			this.elem = this.inputElem;
+			
+		this.labelText = null;
+		
+		this.inputElem.type = (this.isCheckbox ? "checkbox" : "button");
+		this.inputElem.id = this.properties[7];
+		document.body.appendChild(this.elem);
+		
+		if (this.isCheckbox)
+		{
+			this.elem.appendChild(this.inputElem);
+			this.labelText = document.createTextNode(this.properties[1]);
+			this.elem.appendChild(this.labelText);
+			
+			this.inputElem.checked = this.properties[6];
+			
+			// Avoid yucky serif font for checkbox labels
+			this.elem.style.fontFamily = "sans-serif";
+			
+			// Allow setting width and height on label
+			this.elem.style.display = "inline-block";
+			this.elem.style.color = "black";
+		}
+		else
+			this.inputElem.value = this.properties[1];
+		
+		this.elem.title = this.properties[2];
+		this.inputElem.disabled = !this.properties[4];
+		
+		this.autoFontSize = this.properties[5];
+		this.element_hidden = false;
+		
+		if (!this.properties[3])		// initially invisible
+		{
+			this.elem.style.display = "none";
+			this.visible = false;
+			this.element_hidden = true;
+		}
+		
+		this.inputElem.onclick = (function (self) {
+			return function(e) {
+				e.stopPropagation();
+				
+				self.runtime.isInUserInputEvent = true;
+				self.runtime.trigger(cr.plugins_.Button.prototype.cnds.OnClicked, self);
+				self.runtime.isInUserInputEvent = false;
+			};
+		})(this);
+		
+		// Prevent touches reaching the canvas
+		this.elem.addEventListener("touchstart", function (e) {
+			e.stopPropagation();
+		}, false);
+		
+		this.elem.addEventListener("touchmove", function (e) {
+			e.stopPropagation();
+		}, false);
+		
+		this.elem.addEventListener("touchend", function (e) {
+			e.stopPropagation();
+		}, false);
+		
+		// Prevent clicks being blocked
+		this.elem.addEventListener("mousedown", function (e) {
+			e.stopPropagation();
+		});
+		
+		this.elem.addEventListener("mouseup", function (e) {
+			e.stopPropagation();
+		});
+		
+		// Prevent key presses being blocked by the Keyboard object
+		this.elem.addEventListener("keydown", function (e) {
+			e.stopPropagation();
+		});
+		
+		this.elem.addEventListener("keyup", function (e) {
+			e.stopPropagation();
+		});
+		
+		this.lastLeft = 0;
+		this.lastTop = 0;
+		this.lastRight = 0;
+		this.lastBottom = 0;
+		this.lastWinWidth = 0;
+		this.lastWinHeight = 0;
+			
+		this.updatePosition(true);
+		
+		this.runtime.tickMe(this);
 	};
 	
-	Exps.prototype.InitSize = function (ret)
+	instanceProto.saveToJSON = function ()
 	{
-		ret.set_float(this.initsize);
+		var o = {
+			"tooltip": this.elem.title,
+			"disabled": !!this.inputElem.disabled
+		};
+			
+		if (this.isCheckbox)
+		{
+			o["checked"] = !!this.inputElem.checked;
+			o["text"] = this.labelText.nodeValue;
+		}
+		else
+		{
+			o["text"] = this.elem.value;
+		}
+		
+		return o;
 	};
 	
-	Exps.prototype.InitOpacity = function (ret)
+	instanceProto.loadFromJSON = function (o)
 	{
-		ret.set_float(this.initopacity * 100);
+		this.elem.title = o["tooltip"];
+		this.inputElem.disabled = o["disabled"];
+		
+		if (this.isCheckbox)
+		{
+			this.inputElem.checked = o["checked"];
+			this.labelText.nodeValue = o["text"];
+		}
+		else
+		{
+			this.elem.value = o["text"];
+		}
 	};
 	
-	Exps.prototype.InitGrowRate = function (ret)
+	instanceProto.onDestroy = function ()
 	{
-		ret.set_float(this.growrate);
+		this.elem.parentElement.removeChild(this.elem);
+		this.elem = null;
 	};
 	
-	Exps.prototype.XRandom = function (ret)
+	instanceProto.tick = function ()
 	{
-		ret.set_float(this.xrandom);
+		this.updatePosition();
 	};
 	
-	Exps.prototype.YRandom = function (ret)
+	var last_canvas_offset = null;
+	var last_checked_tick = -1;
+	
+	instanceProto.updatePosition = function (first)
 	{
-		ret.set_float(this.yrandom);
+		var left = this.layer.layerToCanvas(this.x, this.y, true);
+		var top = this.layer.layerToCanvas(this.x, this.y, false);
+		var right = this.layer.layerToCanvas(this.x + this.width, this.y + this.height, true);
+		var bottom = this.layer.layerToCanvas(this.x + this.width, this.y + this.height, false);
+		
+		var rightEdge = this.runtime.width / this.runtime.devicePixelRatio;
+		var bottomEdge = this.runtime.height / this.runtime.devicePixelRatio;
+		
+		// Is entirely offscreen or invisible: hide
+		if (!this.visible || !this.layer.visible || right <= 0 || bottom <= 0 || left >= rightEdge || top >= bottomEdge)
+		{
+			if (!this.element_hidden)
+				this.elem.style.display = "none";
+			
+			this.element_hidden = true;
+			return;
+		}
+		
+		// Truncate to canvas size
+		if (left < 1)
+			left = 1;
+		if (top < 1)
+			top = 1;
+		if (right >= rightEdge)
+			right = rightEdge - 1;
+		if (bottom >= bottomEdge)
+			bottom = bottomEdge - 1;
+		
+		var curWinWidth = window.innerWidth;
+		var curWinHeight = window.innerHeight;
+			
+		// Avoid redundant updates
+		if (!first && this.lastLeft === left && this.lastTop === top && this.lastRight === right && this.lastBottom === bottom && this.lastWinWidth === curWinWidth && this.lastWinHeight === curWinHeight)
+		{
+			if (this.element_hidden)
+			{
+				this.elem.style.display = "";
+				this.element_hidden = false;
+			}
+			
+			return;
+		}
+			
+		this.lastLeft = left;
+		this.lastTop = top;
+		this.lastRight = right;
+		this.lastBottom = bottom;
+		this.lastWinWidth = curWinWidth;
+		this.lastWinHeight = curWinHeight;
+		
+		if (this.element_hidden)
+		{
+			this.elem.style.display = "";
+			this.element_hidden = false;
+		}
+		
+		var offx = Math.round(left) + this.runtime.canvas.offsetLeft;
+		var offy = Math.round(top) + this.runtime.canvas.offsetTop;
+		this.elem.style.position = "absolute";
+		this.elem.style.left = offx + "px";
+		this.elem.style.top = offy + "px";
+		this.elem.style.width = Math.round(right - left) + "px";
+		this.elem.style.height = Math.round(bottom - top) + "px";
+		
+		if (this.autoFontSize)
+			this.elem.style.fontSize = ((this.layer.getScale(true) / this.runtime.devicePixelRatio) - 0.2) + "em";
 	};
 	
-	Exps.prototype.InitSpeedRandom = function (ret)
+	// only called if a layout object
+	instanceProto.draw = function(ctx)
 	{
-		ret.set_float(this.speedrandom);
 	};
 	
-	Exps.prototype.InitSizeRandom = function (ret)
+	instanceProto.drawGL = function(glw)
 	{
-		ret.set_float(this.sizerandom);
 	};
 	
-	Exps.prototype.InitGrowRandom = function (ret)
+
+	//////////////////////////////////////
+	// Conditions
+	function Cnds() {};
+	
+	Cnds.prototype.OnClicked = function ()
 	{
-		ret.set_float(this.growrandom);
+		return true;
 	};
 	
-	Exps.prototype.ParticleAcceleration = function (ret)
+	Cnds.prototype.IsChecked = function ()
 	{
-		ret.set_float(this.acc);
+		return this.isCheckbox && this.inputElem.checked;
 	};
 	
-	Exps.prototype.Gravity = function (ret)
+	Cnds.prototype.CompareText = function(text_to_compare, case_sensitive)
 	{
-		ret.set_float(this.g);
+		var text;
+		if (this.isCheckbox)
+			text = this.labelText.nodeValue;
+		else
+			text = this.elem.value;
+			
+		if (case_sensitive)
+			return text == text_to_compare;
+		else
+			return cr.equals_nocase(text, text_to_compare);
 	};
 	
-	Exps.prototype.ParticleAngleRandom = function (ret)
+	pluginProto.cnds = new Cnds();
+	
+	//////////////////////////////////////
+	// Actions
+	function Acts() {};
+
+	Acts.prototype.SetText = function (text)
 	{
-		ret.set_float(this.lifeanglerandom);
+		if (this.isCheckbox)
+			this.labelText.nodeValue = text;
+		else
+			this.elem.value = text;
 	};
 	
-	Exps.prototype.ParticleSpeedRandom = function (ret)
+	Acts.prototype.SetTooltip = function (text)
 	{
-		ret.set_float(this.lifespeedrandom);
+		this.elem.title = text;
 	};
 	
-	Exps.prototype.ParticleOpacityRandom = function (ret)
+	Acts.prototype.SetVisible = function (vis)
 	{
-		ret.set_float(this.lifeopacityrandom);
+		this.visible = (vis !== 0);
 	};
 	
-	Exps.prototype.Timeout = function (ret)
+	Acts.prototype.SetEnabled = function (en)
 	{
-		ret.set_float(this.timeout);
+		this.inputElem.disabled = (en === 0);
 	};
+	
+	Acts.prototype.SetFocus = function ()
+	{
+		this.inputElem.focus();
+	};
+	
+	Acts.prototype.SetBlur = function ()
+	{
+		this.inputElem.blur();
+	};
+	
+	Acts.prototype.SetCSSStyle = function (p, v)
+	{
+		this.elem.style[cr.cssToCamelCase(p)] = v;
+	};
+	
+	Acts.prototype.SetChecked = function (c)
+	{
+		if (!this.isCheckbox)
+			return;
+			
+		this.inputElem.checked = (c === 1);
+	};
+	
+	Acts.prototype.ToggleChecked = function ()
+	{
+		if (!this.isCheckbox)
+			return;
+			
+		this.inputElem.checked = !this.inputElem.checked;
+	};
+	
+	pluginProto.acts = new Acts();
+	
+	//////////////////////////////////////
+	// Expressions
+	function Exps() {};
+	
+	Exps.prototype.Text = function (ret)
+	{
+		if (this.isCheckbox)
+			ret.set_string(this.labelText.nodeValue);
+		else
+			ret.set_string(this.elem.value);
+	}
 	
 	pluginProto.exps = new Exps();
 
@@ -26236,6 +26953,179 @@ cr.behaviors.bound = function(runtime)
 	
 }());
 
+// Piscar
+// ECMAScript 5 strict mode
+
+;
+;
+
+/////////////////////////////////////
+// Behavior class
+cr.behaviors.Flash = function(runtime)
+{
+	this.runtime = runtime;
+};
+
+(function ()
+{
+	var behaviorProto = cr.behaviors.Flash.prototype;
+		
+	/////////////////////////////////////
+	// Behavior type class
+	behaviorProto.Type = function(behavior, objtype)
+	{
+		this.behavior = behavior;
+		this.objtype = objtype;
+		this.runtime = behavior.runtime;
+	};
+	
+	var behtypeProto = behaviorProto.Type.prototype;
+
+	behtypeProto.onCreate = function()
+	{
+	};
+
+	/////////////////////////////////////
+	// Behavior instance class
+	behaviorProto.Instance = function(type, inst)
+	{
+		this.type = type;
+		this.behavior = type.behavior;
+		this.inst = inst;				// associated object instance to modify
+		this.runtime = type.runtime;
+	};
+	
+	var behinstProto = behaviorProto.Instance.prototype;
+
+	behinstProto.onCreate = function()
+	{
+		this.ontime = 0;
+		this.offtime = 0;
+		this.stage = 0;			// 0 = on, 1 = off
+		this.stagetimeleft = 0;
+		this.timeleft = 0;
+	};
+	
+	behinstProto.saveToJSON = function ()
+	{
+		return {
+			"ontime": this.ontime,
+			"offtime": this.offtime,
+			"stage": this.stage,
+			"stagetimeleft": this.stagetimeleft,
+			"timeleft": this.timeleft
+		};
+	};
+	
+	behinstProto.loadFromJSON = function (o)
+	{
+		this.ontime = o["ontime"];
+		this.offtime = o["offtime"];
+		this.stage = o["stage"];
+		this.stagetimeleft = o["stagetimeleft"];
+		this.timeleft = o["timeleft"];
+		
+		// JSON can't store the value Infinity, turning it to null instead.
+		// If we read a null value for time left, turn it back to infinity. (It could have been NaN or -Infinity, but we ignore those cases.)
+		if (this.timeleft === null)
+			this.timeleft = Infinity;
+	};
+
+	behinstProto.tick = function ()
+	{
+		if (this.timeleft <= 0)
+			return;		// not flashing
+			
+		var dt = this.runtime.getDt(this.inst);
+		
+		this.timeleft -= dt;
+		
+		// flash duration completed
+		if (this.timeleft <= 0)
+		{
+			this.timeleft = 0;
+			this.inst.visible = true; 
+			this.runtime.redraw = true;
+			this.runtime.trigger(cr.behaviors.Flash.prototype.cnds.OnFlashEnded, this.inst);
+			return;
+		}
+		
+		this.stagetimeleft -= dt;
+		
+		// switching
+		if (this.stagetimeleft <= 0)
+		{
+			// is on and switching off
+			if (this.stage === 0)
+			{
+				// switch off
+				this.inst.visible = false;
+				this.stage = 1;
+				this.stagetimeleft += this.offtime;
+			}
+			// is off and switching on
+			else
+			{
+				// switch on
+				this.inst.visible = true;
+				this.stage = 0;
+				this.stagetimeleft += this.ontime;
+			}
+			
+			this.runtime.redraw = true;
+		}
+	};
+	
+
+	//////////////////////////////////////
+	// Conditions
+	function Cnds() {};
+	
+	Cnds.prototype.IsFlashing = function ()
+	{
+		return this.timeleft > 0;
+	};
+	
+	Cnds.prototype.OnFlashEnded = function ()
+	{
+		return true;
+	};
+	
+	behaviorProto.cnds = new Cnds();
+
+	//////////////////////////////////////
+	// Actions
+	function Acts() {};
+
+	Acts.prototype.Flash = function (on_, off_, dur_)
+	{
+		this.ontime = on_;
+		this.offtime = off_;
+		this.stage = 1;		// always start off
+		this.stagetimeleft = off_;
+		this.timeleft = dur_;
+		
+		this.inst.visible = false;
+		this.runtime.redraw = true;
+	};
+	
+	Acts.prototype.StopFlashing = function ()
+	{
+		this.timeleft = 0;
+		this.inst.visible = true;
+		this.runtime.redraw = true;
+		return;
+	};
+	
+	behaviorProto.acts = new Acts();
+
+	//////////////////////////////////////
+	// Expressions
+	function Exps() {};
+	behaviorProto.exps = new Exps();
+	
+}());
+
 // Sólido
 // ECMAScript 5 strict mode
 
@@ -26729,179 +27619,6 @@ cr.behaviors.Bullet = function(runtime)
 	
 }());
 
-// Piscar
-// ECMAScript 5 strict mode
-
-;
-;
-
-/////////////////////////////////////
-// Behavior class
-cr.behaviors.Flash = function(runtime)
-{
-	this.runtime = runtime;
-};
-
-(function ()
-{
-	var behaviorProto = cr.behaviors.Flash.prototype;
-		
-	/////////////////////////////////////
-	// Behavior type class
-	behaviorProto.Type = function(behavior, objtype)
-	{
-		this.behavior = behavior;
-		this.objtype = objtype;
-		this.runtime = behavior.runtime;
-	};
-	
-	var behtypeProto = behaviorProto.Type.prototype;
-
-	behtypeProto.onCreate = function()
-	{
-	};
-
-	/////////////////////////////////////
-	// Behavior instance class
-	behaviorProto.Instance = function(type, inst)
-	{
-		this.type = type;
-		this.behavior = type.behavior;
-		this.inst = inst;				// associated object instance to modify
-		this.runtime = type.runtime;
-	};
-	
-	var behinstProto = behaviorProto.Instance.prototype;
-
-	behinstProto.onCreate = function()
-	{
-		this.ontime = 0;
-		this.offtime = 0;
-		this.stage = 0;			// 0 = on, 1 = off
-		this.stagetimeleft = 0;
-		this.timeleft = 0;
-	};
-	
-	behinstProto.saveToJSON = function ()
-	{
-		return {
-			"ontime": this.ontime,
-			"offtime": this.offtime,
-			"stage": this.stage,
-			"stagetimeleft": this.stagetimeleft,
-			"timeleft": this.timeleft
-		};
-	};
-	
-	behinstProto.loadFromJSON = function (o)
-	{
-		this.ontime = o["ontime"];
-		this.offtime = o["offtime"];
-		this.stage = o["stage"];
-		this.stagetimeleft = o["stagetimeleft"];
-		this.timeleft = o["timeleft"];
-		
-		// JSON can't store the value Infinity, turning it to null instead.
-		// If we read a null value for time left, turn it back to infinity. (It could have been NaN or -Infinity, but we ignore those cases.)
-		if (this.timeleft === null)
-			this.timeleft = Infinity;
-	};
-
-	behinstProto.tick = function ()
-	{
-		if (this.timeleft <= 0)
-			return;		// not flashing
-			
-		var dt = this.runtime.getDt(this.inst);
-		
-		this.timeleft -= dt;
-		
-		// flash duration completed
-		if (this.timeleft <= 0)
-		{
-			this.timeleft = 0;
-			this.inst.visible = true; 
-			this.runtime.redraw = true;
-			this.runtime.trigger(cr.behaviors.Flash.prototype.cnds.OnFlashEnded, this.inst);
-			return;
-		}
-		
-		this.stagetimeleft -= dt;
-		
-		// switching
-		if (this.stagetimeleft <= 0)
-		{
-			// is on and switching off
-			if (this.stage === 0)
-			{
-				// switch off
-				this.inst.visible = false;
-				this.stage = 1;
-				this.stagetimeleft += this.offtime;
-			}
-			// is off and switching on
-			else
-			{
-				// switch on
-				this.inst.visible = true;
-				this.stage = 0;
-				this.stagetimeleft += this.ontime;
-			}
-			
-			this.runtime.redraw = true;
-		}
-	};
-	
-
-	//////////////////////////////////////
-	// Conditions
-	function Cnds() {};
-	
-	Cnds.prototype.IsFlashing = function ()
-	{
-		return this.timeleft > 0;
-	};
-	
-	Cnds.prototype.OnFlashEnded = function ()
-	{
-		return true;
-	};
-	
-	behaviorProto.cnds = new Cnds();
-
-	//////////////////////////////////////
-	// Actions
-	function Acts() {};
-
-	Acts.prototype.Flash = function (on_, off_, dur_)
-	{
-		this.ontime = on_;
-		this.offtime = off_;
-		this.stage = 1;		// always start off
-		this.stagetimeleft = off_;
-		this.timeleft = dur_;
-		
-		this.inst.visible = false;
-		this.runtime.redraw = true;
-	};
-	
-	Acts.prototype.StopFlashing = function ()
-	{
-		this.timeleft = 0;
-		this.inst.visible = true;
-		this.runtime.redraw = true;
-		return;
-	};
-	
-	behaviorProto.acts = new Acts();
-
-	//////////////////////////////////////
-	// Expressions
-	function Exps() {};
-	behaviorProto.exps = new Exps();
-	
-}());
-
 // Senóide
 // ECMAScript 5 strict mode
 
@@ -27305,12 +28022,14 @@ cr.getObjectRefTable = function () {
 		cr.behaviors.Platform,
 		cr.behaviors.scrollto,
 		cr.behaviors.bound,
+		cr.behaviors.Flash,
 		cr.behaviors.solid,
 		cr.plugins_.Keyboard,
 		cr.behaviors.Bullet,
-		cr.behaviors.Flash,
-		cr.plugins_.Particles,
 		cr.behaviors.Sin,
+		cr.plugins_.Text,
+		cr.plugins_.progressbar,
+		cr.plugins_.Button,
 		cr.behaviors.Platform.prototype.cnds.IsMoving,
 		cr.plugins_.Sprite.prototype.acts.SetAnim,
 		cr.plugins_.Keyboard.prototype.cnds.IsKeyDown,
@@ -27329,7 +28048,15 @@ cr.getObjectRefTable = function () {
 		cr.plugins_.Sprite.prototype.acts.Destroy,
 		cr.behaviors.Flash.prototype.acts.Flash,
 		cr.system_object.prototype.exps.random,
-		cr.system_object.prototype.acts.AddVar
+		cr.system_object.prototype.acts.AddVar,
+		cr.system_object.prototype.cnds.EveryTick,
+		cr.plugins_.Text.prototype.acts.SetText,
+		cr.behaviors.Flash.prototype.cnds.IsFlashing,
+		cr.plugins_.Sprite.prototype.acts.SetCollisions,
+		cr.system_object.prototype.acts.GoToLayout,
+		cr.plugins_.Text.prototype.acts.SetVisible,
+		cr.plugins_.Button.prototype.cnds.OnClicked,
+		cr.system_object.prototype.acts.SetVar
 	];
 };
 
